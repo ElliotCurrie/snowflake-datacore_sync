@@ -1,9 +1,19 @@
+"""
+Lightweight database client wrappers used by the sync engine.
+
+These classes deliberately expose a small common surface area: connect,
+reconnect, availability checks, cursor access, and a run_when_available wrapper.
+That keeps the sync code mostly database-agnostic while still allowing each
+backend to handle its own connection details.
+"""
+
 import pyodbc
 import snowflake.connector
 import time
 
 
 class SqlServerClient:
+    """Small wrapper around a pyodbc SQL Server connection."""
     def __init__(
         self,
         driver,
@@ -28,6 +38,7 @@ class SqlServerClient:
         self.connect()
 
     def connect(self):
+        """Open a SQL Server connection using the configured ODBC driver."""
         self.conn = pyodbc.connect(
             f"DRIVER={{{self.driver}}};"
             f"SERVER={self.server};"
@@ -42,6 +53,7 @@ class SqlServerClient:
         self.conn.autocommit = False
 
     def reconnect(self):
+        """Close the current connection if possible, then open a new one."""
         try:
             self.conn.close()
         except Exception:
@@ -50,6 +62,7 @@ class SqlServerClient:
         self.connect()
 
     def is_available(self):
+        """Return True when a trivial SQL statement succeeds."""
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT 1;")
@@ -60,6 +73,7 @@ class SqlServerClient:
             return False
 
     def wait_until_available(self, check_interval_seconds=30):
+        """Block until SQL Server accepts a new connection again."""
         while True:
             try:
                 self.reconnect()
@@ -74,6 +88,12 @@ class SqlServerClient:
             time.sleep(check_interval_seconds)
 
     def run_when_available(self, func, *args, **kwargs):
+        """
+        Run a database operation, retrying only when the connection has dropped.
+
+        If SQL Server is still reachable after an exception, the exception is
+        treated as a real query/data error and is raised immediately.
+        """
         while True:
             try:
                 return func(self, *args, **kwargs)
@@ -101,6 +121,7 @@ class SqlServerClient:
             pass
 
     def list_tables(self, schema_name):
+        """List user tables in a SQL Server schema."""
         sql = """
             SELECT
                 t.name AS table_name
@@ -132,6 +153,7 @@ class SqlServerClient:
             cur.close()
 
     def get_table_schema(self, schema_name, table_name):
+        """Return SQL Server column metadata for a target or staging table."""
         sql = """
             SELECT
                 column_name,
@@ -182,6 +204,7 @@ class SqlServerClient:
 
 
 class SnowflakeClient:
+    """Small wrapper around a Snowflake connector connection."""
     def __init__(
         self,
         user,
@@ -206,6 +229,7 @@ class SnowflakeClient:
         self.connect()
 
     def connect(self):
+        """Open a Snowflake connection using the configured warehouse/database/schema."""
         self.conn = snowflake.connector.connect(
             user=self.user,
             password=self.password,
@@ -218,6 +242,7 @@ class SnowflakeClient:
         )
 
     def reconnect(self):
+        """Close the current Snowflake connection if possible, then reconnect."""
         try:
             self.conn.close()
         except Exception:
@@ -226,6 +251,7 @@ class SnowflakeClient:
         self.connect()
 
     def is_available(self):
+        """Return True when a trivial Snowflake statement succeeds."""
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT 1;")
@@ -236,6 +262,7 @@ class SnowflakeClient:
             return False
 
     def wait_until_available(self, check_interval_seconds=30):
+        """Block until Snowflake accepts a new connection again."""
         while True:
             try:
                 self.reconnect()
@@ -250,6 +277,12 @@ class SnowflakeClient:
             time.sleep(check_interval_seconds)
 
     def run_when_available(self, func, *args, **kwargs):
+        """
+        Run a Snowflake operation, retrying only when the connection has dropped.
+
+        Query/data errors are not hidden. If Snowflake is reachable after the
+        exception, the original exception is re-raised.
+        """
         while True:
             try:
                 return func(self, *args, **kwargs)
@@ -271,6 +304,7 @@ class SnowflakeClient:
             pass
 
     def list_tables(self):
+        """List base tables in the configured Snowflake schema."""
         sql = """
             SELECT
                 table_name
@@ -297,6 +331,12 @@ class SnowflakeClient:
             cur.close()
 
     def get_table_schema(self, table_name):
+        """
+        Return Snowflake column metadata and mark primary-key columns.
+
+        SHOW PRIMARY KEYS is used because information_schema.columns does not
+        expose the primary-key flag in the shape needed by the sync engine.
+        """
         table_name_upper = table_name.upper()
 
         primary_key_sql = (

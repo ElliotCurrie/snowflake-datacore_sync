@@ -1,3 +1,16 @@
+"""
+Entry point for the Snowflake -> Datacore replication process.
+
+The script runs the same sync engine against multiple Snowflake instances
+(currently Core and SA) and writes into separate SQL Server schemas. Each run:
+
+1. checks both database connections;
+2. creates any missing target/staging tables;
+3. processes each configured table in batches;
+4. records run/table status in ops sync log tables;
+5. continues past table-level failures so one bad table does not block the rest.
+"""
+
 import time
 from datetime import datetime
 import traceback
@@ -6,7 +19,13 @@ import utils
 from clients import SqlServerClient, SnowflakeClient
 from configs import datacore_config, core_snowflake_config, sa_snowflake_config
 
+# Number of Snowflake rows to fetch per batch.
+# Keep this high enough for throughput, but low enough that staging inserts and
+# SQL Server merges remain manageable inside one transaction.
 BATCH_LIMIT = 50000
+
+# Intended pause between whole sync cycles if this script is later wrapped in a
+# continuous loop/service. Currently the __main__ block performs one pass.
 SLEEP_AFTER_SYNC_RUN_SECONDS = 900
 
 # -----------------------------------
@@ -14,6 +33,14 @@ SLEEP_AFTER_SYNC_RUN_SECONDS = 900
 # -----------------------------------
 
 def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
+    """
+    Drain one configured Snowflake table into Datacore until no rows remain.
+
+    The watermark comes from ops.table_config and is advanced only after a
+    successful staging insert + target merge. This keeps the process resumable:
+    if a batch fails midway, the table will retry from the previous committed
+    watermark on the next run.
+    """
     total_rows_processed = 0
     batch_number = 0
 
@@ -26,6 +53,8 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
     utils.log(f"{schema_name}.{table_name}: draining table until empty...")
 
     while True:
+        # Each loop processes one ordered Snowflake batch. The final loop will
+        # usually return zero rows, which is the signal that the table is drained.
         batch_number += 1
 
         utils.log(
@@ -33,6 +62,8 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
             f"from last_synced={last_synced}, last_pk={last_pk}"
         )
 
+        # A separate log item is written per table batch. This makes failures
+        # much easier to diagnose than having one giant table-level log row.
         sync_log_item_id = datacore.run_when_available(
             utils.start_sync_log_item,
             sync_log_id=sync_log_id,
@@ -57,6 +88,9 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
                 limit=BATCH_LIMIT
             )
 
+            # No rows means the current table has caught up to Snowflake. The
+            # final empty batch is still logged as success so the audit trail
+            # shows that the table was checked, not skipped.
             if not sf_rows:
                 datacore.run_when_available(
                     utils.update_sync_log_item,
@@ -78,10 +112,63 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
 
             utils.log(f"{schema_name}.{table_name}: fetched {len(sf_rows):,} rows from Snowflake.")
 
+            # Do not let known bad source rows become staging/merge failures.
+            # The batch is fetched first, then split locally: rejected rows are
+            # logged to ops.insert_errors, while only keyed rows continue into
+            # staging. That way the error log reflects rows we actually saw,
+            # not rows hidden by the Snowflake query.
+            valid_rows, null_pk_rows = utils.split_rows_by_required_pk(
+                columns=sf_columns,
+                rows=sf_rows,
+                pk_column=pk_column,
+            )
+
+            if null_pk_rows:
+                rejected_result = datacore.run_when_available(
+                    utils.insert_insert_errors,
+                    error_reason="NULL_PK",
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    columns=sf_columns,
+                    rows=null_pk_rows,
+                    sync_log_item_id=sync_log_item_id,
+                )
+
+                utils.log(
+                    f"{schema_name}.{table_name}: processed "
+                    f"{rejected_result['attempted']:,} NULL_PK rejected row(s). "
+                    f"Inserted into ops.insert_errors={rejected_result['inserted']:,}, "
+                    f"skipped duplicates={rejected_result['skipped_as_duplicates']:,}."
+                )
+
+            if not valid_rows:
+                datacore.run_when_available(
+                    utils.update_sync_log_item,
+                    sync_log_item_id=sync_log_item_id,
+                    status="success",
+                    rows_inserted=0,
+                    rows_updated=0,
+                    last_synced=last_synced,
+                    last_pk=last_pk,
+                )
+
+                utils.log(
+                    f"{schema_name}.{table_name}: batch contained no valid rows. "
+                    f"Rejected rows={len(null_pk_rows):,}. "
+                    f"Stopping this table to avoid retrying the same rejected-only batch."
+                )
+
+                break
+
+            sf_rows = valid_rows
+
             total_rows_processed += len(sf_rows)
 
             utils.log(f"{schema_name}.{table_name}: checking payload columns exist in target/staging...")
 
+            # Fivetran can introduce new columns without warning. Before the
+            # insert, compare the current payload against target and staging so
+            # additive schema changes are handled automatically.
             snowflake_schema = snowflake.run_when_available(
                 type(snowflake).get_table_schema,
                 table_name=table_name,
@@ -110,6 +197,9 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
                     f"Staging={staging_columns_added}"
                 )
 
+            # Staging is deliberately transient. Each batch is loaded into an
+            # empty staging table, merged into the target, then replaced by the
+            # next batch.
             utils.log(f"{schema_name}.{table_name}: clearing staging table...")
 
             datacore.run_when_available(
@@ -138,6 +228,9 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
                 pk_column=pk_column
             )
 
+            # JNL is the source for certificate-related events. This derived
+            # event table is updated from the same staged batch so it stays in
+            # step with the base replication process.
             if schema_name == "reapit" and table_name == "jnl":
                 utils.log(f"{schema_name}.{table_name}: upserting certificate events from staging...")
 
@@ -178,12 +271,8 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
                     f"deleted={event_result['rows_deleted']:,}."
                 )
 
-            last_synced, last_pk = utils.get_batch_watermark(
-                columns=sf_columns,
-                rows=sf_rows,
-                pk_column=pk_column
-            )
-
+            # Watermark must be based on the final row in the ordered batch.
+            # It is stored only after the merge succeeds.
             last_synced, last_pk = utils.get_batch_watermark(
                 columns=sf_columns,
                 rows=sf_rows,
@@ -221,6 +310,8 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
             utils.log(f"{schema_name}.{table_name}: table_config watermark updated.")
 
         except Exception as e:
+            # Mark this batch as failed, then re-raise so the caller can decide
+            # whether to continue with the next table or fail the whole run.
             utils.log(f"batch {batch_number} failed: {type(e).__name__}: {repr(e)}")
             utils.log(traceback.format_exc())
 
@@ -243,6 +334,12 @@ def sync_table_until_empty(datacore, snowflake, sync_log_id, table_config_row):
 # -----------------------------------
 
 def build_failed_tables_error(failed_tables: list[str], max_length: int = 1000) -> str | None:
+    """
+    Build a compact run-level error summary from table-level failures.
+
+    ops.sync_logs.error has finite space, so long lists are truncated while
+    preserving the failed-table count at the front.
+    """
     if not failed_tables:
         return None
 
@@ -268,6 +365,12 @@ def build_failed_tables_error(failed_tables: list[str], max_length: int = 1000) 
 # -----------------------------------
 
 def main(datacore, snowflake, sync_schema_name):
+    """
+    Run one full sync cycle for a single Snowflake instance/schema pair.
+
+    Table-level failures are collected and reported as completed_with_errors;
+    only failures before/during orchestration are treated as run-level failure.
+    """
     utils.log(f"Checking SQL Server and Snowflake connections for {sync_schema_name}...")
     utils.wait_for_all_connections(datacore, snowflake)
 
@@ -303,6 +406,8 @@ def main(datacore, snowflake, sync_schema_name):
             f"for schema '{sync_schema_name}'."
         )
 
+        # Process tables serially. This is intentionally boring: fewer moving
+        # parts, simpler SQL locking behaviour, and clearer failure recovery.
         for index, row in enumerate(table_config, start=1):
             schema_name = row["schema_name"]
             table_name = row["table_name"]
@@ -333,6 +438,8 @@ def main(datacore, snowflake, sync_schema_name):
                 )
 
             except Exception as table_error:
+                # A single bad table should not prevent unrelated tables from
+                # syncing. The run is marked completed_with_errors at the end.
                 failed_tables.append(full_table_name)
 
                 utils.log(
@@ -397,8 +504,11 @@ def main(datacore, snowflake, sync_schema_name):
 
 
 if __name__ == "__main__":
+    # One shared SQL Server connection is reused for both Snowflake instances.
     datacore = SqlServerClient(**datacore_config)
 
+    # Each source instance maps to its own target schema. The same sync logic is
+    # reused; only connection details and schema names differ.
     snowflake_instances = [
         {
             "name": "core",

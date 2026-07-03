@@ -1,7 +1,23 @@
+"""
+Utility functions for the Snowflake -> Datacore sync process.
+
+This module contains the operational pieces used by main.py: logging, schema
+mapping/evolution, sync audit logging, batch fetching, staging inserts, target
+merges, watermark handling, and the derived Reapit certificate event upsert.
+"""
+
 from datetime import datetime, date
 from pathlib import Path
+import hashlib
+import json
 
 def log(message, max_length=2000):
+    """
+    Print a timestamped message and append it to the daily local log file.
+
+    Long messages are truncated to avoid enormous tracebacks or payloads making
+    the log unreadable.
+    """
     log_dir = Path("logs")
     now = datetime.now()
 
@@ -26,6 +42,7 @@ def log(message, max_length=2000):
 
 
 def truncate_error(error: Exception | str | None, max_length: int = 2000) -> str | None:
+    """Return a database-safe error string while preserving truncation context."""
     if error is None:
         return None
 
@@ -44,6 +61,13 @@ def truncate_error(error: Exception | str | None, max_length: int = 2000) -> str
 
 
 def snowflake_column_to_sql_server_definition(column, primary_key=None):
+    """
+    Convert one Snowflake column metadata row into a SQL Server column definition.
+
+    This is intentionally conservative. Unknown/semi-structured types are stored
+    as NVARCHAR(MAX), and text primary keys are capped at NVARCHAR(450) so they
+    can be indexed by SQL Server.
+    """
     column_name = column["column_name"].lower()
     data_type = column["data_type"].upper()
 
@@ -56,6 +80,8 @@ def snowflake_column_to_sql_server_definition(column, primary_key=None):
     numeric_precision = column.get("numeric_precision")
     numeric_scale = column.get("numeric_scale")
 
+    # SQL Server cannot index NVARCHAR(MAX), so string primary keys need a
+    # bounded length. 450 is a safe default for indexed NVARCHAR columns.
     if data_type in {"TEXT", "VARCHAR", "CHAR", "CHARACTER", "STRING"}:
         if is_primary_key:
             sql_type = "NVARCHAR(450)"
@@ -116,6 +142,8 @@ def snowflake_column_to_sql_server_definition(column, primary_key=None):
     elif data_type == "TIME":
         sql_type = "TIME"
 
+    # Snowflake semi-structured values do not have a direct SQL Server equivalent
+    # in this sync, so store their JSON/text representation.
     elif data_type in {"VARIANT", "OBJECT", "ARRAY"}:
         sql_type = "NVARCHAR(MAX)"
 
@@ -137,6 +165,7 @@ def insert_db_schema_evo_log(
     schema_name,
     table_name,
 ):
+    """Record that a whole table was created by schema evolution."""
     sql = """
         INSERT INTO ops.db_schema_evo_log (
             schema_name,
@@ -175,6 +204,7 @@ def insert_tbl_schema_evo_log(
     table_name,
     column_name,
 ):
+    """Record that an individual column was added by schema evolution."""
     sql = """
         INSERT INTO ops.tbl_schema_evo_log (
             schema_name,
@@ -216,6 +246,18 @@ def handle_schema_changes(
     sync_schema_name="reapit",
     staging_schema_name="stg",
 ):
+    """
+    Bring Datacore target/staging schemas up to date with Snowflake.
+
+    Missing target tables are created from Snowflake metadata. Missing staging
+    tables are cloned from the target shape. Newly created target tables are also
+    inserted into ops.table_config so they are picked up by the sync loop.
+
+    Deliberate limitation: this handles additive schema/table changes only. It
+    does not rename/drop columns or resolve composite primary keys.
+    """
+    # Keep helper functions local because they are implementation details of the
+    # schema-evolution workflow, not general-purpose utilities.
     def normalise_name(name):
         return str(name).lower()
 
@@ -225,6 +267,7 @@ def handle_schema_changes(
         table_name,
         primary_key,
     ):
+        """Create/update ops.table_config so a new target table can sync."""
         sql = """
             UPDATE ops.table_config
             SET
@@ -277,6 +320,7 @@ def handle_schema_changes(
             cur.close()
 
     def get_single_primary_key_from_schema(table_schema, table_name):
+        """Return the one primary key column required by the watermark logic."""
         primary_key_columns = [
             column["column_name"].lower()
             for column in table_schema
@@ -305,6 +349,7 @@ def handle_schema_changes(
         table_schema,
         primary_key,
     ):
+        """Create a Datacore target table using Snowflake column metadata."""
         column_definitions = [
             snowflake_column_to_sql_server_definition(
                 column,
@@ -341,6 +386,7 @@ def handle_schema_changes(
         source_schema_name,
         table_name,
     ):
+        """Create an empty staging table by cloning the target table shape."""
         staging_table_name = f"{source_schema_name}_{table_name}"
 
         sql = f"""
@@ -562,6 +608,12 @@ def ensure_columns_exist_from_payload(
     sf_columns,
     snowflake_schema,
 ):
+    """
+    Add any Snowflake payload columns missing from a Datacore table.
+
+    The check is driven by the actual batch payload rather than the whole source
+    schema, which keeps work scoped to columns that are about to be inserted.
+    """
     target_schema = datacore.run_when_available(
         type(datacore).get_table_schema,
         schema_name=schema_name,
@@ -573,6 +625,8 @@ def ensure_columns_exist_from_payload(
         for row in target_schema
     }
 
+    # Compare names case-insensitively because Snowflake and SQL Server surface
+    # metadata casing differently.
     missing_column_names = {
         col.lower()
         for col in sf_columns
@@ -626,6 +680,7 @@ def ensure_columns_exist_from_payload(
 
 
 def wait_for_all_connections(sql_server, snowflake):
+    """Block startup until both SQL Server and Snowflake are reachable."""
     while True:
         sql_ok = sql_server.is_available()
         sf_ok = snowflake.is_available()
@@ -643,6 +698,7 @@ def wait_for_all_connections(sql_server, snowflake):
 
 
 def start_sync_run(sql_server):
+    """Insert the parent ops.sync_logs row for one schema sync run."""
     sql = """
         SET NOCOUNT ON;
 
@@ -681,6 +737,7 @@ def start_sync_run(sql_server):
 
 
 def update_sync_run(sql_server, sync_log_id, status, error=None):
+    """Mark the parent sync run as completed, failed, or completed_with_errors."""
     sql = """
         UPDATE ops.sync_logs
         SET
@@ -708,6 +765,7 @@ def update_sync_run(sql_server, sync_log_id, status, error=None):
 
 
 def start_sync_log_item(sql_server, sync_log_id, schema_name, table_name):
+    """Insert a child ops.sync_log_items row for one table batch."""
     sql = """
         SET NOCOUNT ON;
 
@@ -782,6 +840,7 @@ def update_sync_log_item(
     last_pk=None,
     error=None
 ):
+    """Update the child table-batch log row after success/failure."""
     sql = """
         UPDATE ops.sync_log_items
         SET
@@ -824,12 +883,29 @@ def update_sync_log_item(
         cursor.close()
 
 
-def fetch_snowflake_batch(snowflake, table_name, pk_column, last_synced, last_pk, limit=50_000):
-    last_synced_formatted = (
-        last_synced.strftime("%Y-%m-%d %H:%M:%S.%f")
-        if isinstance(last_synced, (datetime, date))
-        else str(last_synced)
+def format_snowflake_watermark(value):
+    """Format the stored SQL Server watermark for Snowflake timestamp comparison."""
+    return (
+        value.strftime("%Y-%m-%d %H:%M:%S.%f")
+        if isinstance(value, (datetime, date))
+        else str(value)
     ) + " +0000"
+
+
+def fetch_snowflake_batch(snowflake, table_name, pk_column, last_synced, last_pk, limit=50_000):
+    """
+    Fetch the next ordered Snowflake batch after the stored watermark.
+
+    _FIVETRAN_SYNCED is the primary watermark. The primary key is used as a
+    tie-breaker so rows with the same Fivetran timestamp are not skipped between
+    batches.
+
+    This deliberately does not exclude NULL primary keys. Rejected rows should
+    be rows the sync actually fetched, then split out and logged before staging.
+    Otherwise ops.insert_errors would only be recording a second query, not the
+    true batch that was about to be processed.
+    """
+    last_synced_formatted = format_snowflake_watermark(last_synced)
 
     sql = f"""
         SELECT *
@@ -838,7 +914,10 @@ def fetch_snowflake_batch(snowflake, table_name, pk_column, last_synced, last_pk
             _FIVETRAN_SYNCED > %s
             OR (
                 _FIVETRAN_SYNCED = %s
-                AND {pk_column} > %s
+                AND (
+                    {pk_column} > %s
+                    OR {pk_column} IS NULL
+                )
             )
         )
         ORDER BY _FIVETRAN_SYNCED, {pk_column}
@@ -859,7 +938,130 @@ def fetch_snowflake_batch(snowflake, table_name, pk_column, last_synced, last_pk
         cur.close()
 
 
+def split_rows_by_required_pk(columns, rows, pk_column):
+    """Split fetched rows into mergeable rows and rows rejected for NULL PK."""
+    if not rows:
+        return [], []
+
+    col_lookup = {
+        col.lower(): idx
+        for idx, col in enumerate(columns)
+    }
+
+    pk_idx = col_lookup[pk_column.lower()]
+
+    valid_rows = []
+    null_pk_rows = []
+
+    for row in rows:
+        pk_value = row[pk_idx]
+
+        if pk_value is None or str(pk_value).strip() == "":
+            null_pk_rows.append(row)
+        else:
+            valid_rows.append(row)
+
+    return valid_rows, null_pk_rows
+
+
+def insert_insert_errors(
+    sql_server,
+    error_reason,
+    schema_name,
+    table_name,
+    columns,
+    rows,
+    sync_log_item_id,
+):
+    """
+    Write rejected source rows to ops.insert_errors without duplicating repeats.
+
+    The row payload is converted to deterministic JSON and hashed with the
+    source table name plus error reason. The hash is used as the de-duplication
+    key, so re-running the sync does not keep inserting the same rejected row.
+
+    ops.insert_errors stores sync_log_item_id rather than schema/table directly,
+    so the source table can still be recovered by joining back to
+    ops.sync_log_items when needed.
+    """
+    if not rows:
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "skipped_as_duplicates": 0,
+        }
+
+    sql = """
+        INSERT INTO ops.insert_errors (
+            error_reason,
+            payload,
+            sync_log_item_id,
+            error_hash
+        )
+        SELECT
+            ?,
+            ?,
+            ?,
+            ?
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM ops.insert_errors
+            WHERE error_hash = ?
+        );
+    """
+
+    source_name = f"{schema_name}.{table_name}"
+    inserted = 0
+
+    cur = sql_server.cursor()
+
+    try:
+        for row in rows:
+            payload = json.dumps(
+                dict(zip(columns, row)),
+                default=str,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+
+            error_hash = hashlib.sha256(
+                f"{source_name}|{error_reason}|{payload}".encode("utf-8")
+            ).digest()
+
+            cur.execute(
+                sql,
+                (
+                    error_reason,
+                    payload,
+                    sync_log_item_id,
+                    error_hash,
+                    error_hash,
+                ),
+            )
+
+            if cur.rowcount == 1:
+                inserted += 1
+
+        sql_server.commit()
+
+        attempted = len(rows)
+
+        return {
+            "attempted": attempted,
+            "inserted": inserted,
+            "skipped_as_duplicates": attempted - inserted,
+        }
+
+    except Exception:
+        sql_server.rollback()
+        raise
+
+    finally:
+        cur.close()
+
+
 def ingest_staging_datacore(sql_server, schema_name, table_name, columns, rows):
+    """Bulk insert one fetched Snowflake batch into the matching staging table."""
     if not rows:
         return 0
 
@@ -874,6 +1076,8 @@ def ingest_staging_datacore(sql_server, schema_name, table_name, columns, rows):
     """
 
     cur = sql_server.cursor()
+    # Critical for performance with pyodbc/ODBC Driver 18. Without this, large
+    # inserts can degrade to painfully slow row-by-row behaviour.
     cur.fast_executemany = True
 
     try:
@@ -890,6 +1094,7 @@ def ingest_staging_datacore(sql_server, schema_name, table_name, columns, rows):
 
 
 def get_batch_watermark(columns, rows, pk_column):
+    """Return the watermark from the final row of an ordered batch."""
     if not rows:
         return None, None
 
@@ -907,6 +1112,7 @@ def get_batch_watermark(columns, rows, pk_column):
 
 
 def clear_staging_table(sql_server, schema_name, table_name):
+    """Empty the staging table before loading the next batch."""
     staging_table = f"[stg].[{schema_name}_{table_name}]"
 
     sql = f"""
@@ -928,9 +1134,16 @@ def clear_staging_table(sql_server, schema_name, table_name):
 
 
 def merge_staging_to_target(sql_server, schema_name, table_name, pk_column, columns):
+    """
+    Apply the staged batch to the target table and return row counts.
+
+    Updates are applied first for matching primary keys, then inserts are applied
+    for keys not already present in the target.
+    """
     target_table = f"[{schema_name}].[{table_name}]"
     staging_table = f"[stg].[{schema_name}_{table_name}]"
 
+    # The primary key is used only for matching and must not be updated.
     non_pk_columns = [
         c for c in columns
         if c.lower() != pk_column.lower()
@@ -1015,6 +1228,7 @@ def merge_staging_to_target(sql_server, schema_name, table_name, pk_column, colu
 
 
 def fetch_table_config(sql_server, schema_name):
+    """Fetch table sync configuration and default missing watermarks."""
     sql = """
         SELECT
             schema_name,
@@ -1047,6 +1261,7 @@ def fetch_table_config(sql_server, schema_name):
 
 
 def update_table_config_watermark(sql_server, schema_name, table_name, last_synced, last_pk):
+    """Persist the latest successful table watermark in ops.table_config."""
     sql = """
         UPDATE ops.table_config
         SET
@@ -1088,6 +1303,7 @@ def start_reapit_events_upsert_log(
     staging_table_name,
     event_table_name,
 ):
+    """Start an audit log row for the derived Reapit event upsert."""
     sql = """
         SET NOCOUNT ON;
 
@@ -1151,6 +1367,7 @@ def update_reapit_events_upsert_log(
     rows_deleted=None,
     error=None,
 ):
+    """Finish the Reapit event upsert audit log row with counts/error state."""
     sql = """
         UPDATE ops.reapit_events_upsert_logs
         SET
@@ -1199,6 +1416,14 @@ def upsert_certificate_events_from_staging(
     source_schema_name,
     source_table_name,
 ):
+    """
+    Build/update certificate_events from the currently staged JNL batch.
+
+    This is intentionally tied to the replication batch so the derived event
+    table advances alongside the raw JNL table and shares the same sync log item.
+    """
+    # Guard against accidentally writing the derived events under the wrong
+    # RPS instance label.
     if rps_instance not in {"core", "sa"}:
         raise ValueError(
             f"Invalid rps_instance for certificate event staging upsert: {rps_instance}"
