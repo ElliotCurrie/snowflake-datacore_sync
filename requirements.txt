@@ -1,0 +1,2 @@
+pyodbc
+snowflake-connector-python
